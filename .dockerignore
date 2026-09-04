@@ -1,0 +1,9 @@
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.env
+*.zip
+flood_tile.zip
+start_ngrok.bat
+start_ngrok.ps1
