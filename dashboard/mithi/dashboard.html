@@ -282,6 +282,9 @@ input[type=range]{flex:1;accent-color:var(--marigold);height:22px}
 
     document.getElementById('hdrDate').textContent = 'state of ' + D.generated;
     if(D.tagline) document.getElementById('tagline').textContent = D.tagline;
+    if(D.river_name){
+      document.title = D.river_name + ' · JalNetra BOD/COD';
+    }
 
     const scrub = document.getElementById('scrub');
     scrub.max = timeline.length - 1;

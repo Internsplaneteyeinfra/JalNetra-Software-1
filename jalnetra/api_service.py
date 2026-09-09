@@ -309,7 +309,7 @@ def bod_cod_pipeline(kml_bytes: bytes) -> Tuple[Dict[str, Any], Dict[str, Any], 
 
     meta = {
         "tagline": river_meta.get("tagline")
-        or f"River organic-pollution twin · {location.river_name}",
+        or f"{location.river_name} · BOD/COD river twin",
         "river_name": river_meta.get("river_name") or location.river_name,
         "landmarks": landmarks,
         "kml_reach_id": location.reach_id,
