@@ -1,9 +1,9 @@
 """
 jalnetra.kml_locator — parse uploaded KML and build river reach / chainage.
 
-Chainage and reach names come from Point placemarks (bridges) in the KML when
-present. Each uploaded river gets its own synthetic demo seed from the centroid
-so responses differ by KML (e.g. Godavari ≠ Mithi).
+BOD/COD chainage uses fixed 2 km segments along the KML axis (0–2, 2–4, …)
+for the uploaded river length. Each uploaded river gets its own synthetic demo
+seed from the centroid so responses differ by KML (e.g. Godavari ≠ Mithi).
 """
 from __future__ import annotations
 
@@ -432,6 +432,182 @@ def _haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
 
+def _path_length_km(points: List[Tuple[float, float]]) -> float:
+    """Sum consecutive haversine segments along an ordered polyline."""
+    if len(points) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(len(points) - 1):
+        total += _haversine_km(
+            points[i][0], points[i][1], points[i + 1][0], points[i + 1][1]
+        )
+    return total
+
+
+def _open_ring(pts: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Drop duplicate closing vertex from a ring."""
+    if len(pts) >= 2 and pts[0] == pts[-1]:
+        return pts[:-1]
+    return pts
+
+
+def _polygon_bank_length_km(pts: List[Tuple[float, float]]) -> float:
+    """
+    Approximate river length from a corridor polygon: longer boundary walk
+    between the two farthest vertices (≈ one bank from start → end).
+    """
+    ring = _open_ring(pts)
+    n = len(ring)
+    if n < 2:
+        return 0.0
+    if n == 2:
+        return _haversine_km(ring[0][0], ring[0][1], ring[1][0], ring[1][1])
+
+    seg = [
+        _haversine_km(
+            ring[i][0], ring[i][1], ring[(i + 1) % n][0], ring[(i + 1) % n][1]
+        )
+        for i in range(n)
+    ]
+    peri = sum(seg)
+    best_i, best_j, best_d = 0, 1, -1.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = _haversine_km(ring[i][0], ring[i][1], ring[j][0], ring[j][1])
+            if d > best_d:
+                best_d = d
+                best_i, best_j = i, j
+
+    walk = 0.0
+    i = best_i
+    while i != best_j:
+        walk += seg[i]
+        i = (i + 1) % n
+    return max(walk, peri - walk)
+
+
+def _stitch_polylines(
+    lines: List[List[Tuple[float, float]]],
+) -> List[Tuple[float, float]]:
+    """Greedy nearest-endpoint chaining so multi-part KML lines become one path."""
+    remaining = [list(L) for L in lines if len(L) >= 2]
+    if not remaining:
+        return []
+    # Start from the longest piece
+    remaining.sort(key=_path_length_km, reverse=True)
+    path = remaining.pop(0)
+    while remaining:
+        best_i = 0
+        best_d = float("inf")
+        best_attach = "end"  # attach to path end or start
+        best_flip = False
+        for i, L in enumerate(remaining):
+            candidates = (
+                ("end", False, path[-1], L[0]),
+                ("end", True, path[-1], L[-1]),
+                ("start", False, path[0], L[-1]),
+                ("start", True, path[0], L[0]),
+            )
+            for attach, flip, a, b in candidates:
+                d = _haversine_km(a[0], a[1], b[0], b[1])
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+                    best_attach = attach
+                    best_flip = flip
+        L = remaining.pop(best_i)
+        seq = list(reversed(L)) if best_flip else L
+        if best_attach == "end":
+            path = path + seq
+        else:
+            path = seq + path
+    return path
+
+
+def _coords_from_element(elem: ET.Element) -> List[Tuple[float, float]]:
+    """Parse lon/lat pairs under the first <coordinates> child of elem."""
+    for child in elem.iter():
+        if _local_name(child.tag) != "coordinates":
+            continue
+        if not child.text or not child.text.strip():
+            continue
+        pts: List[Tuple[float, float]] = []
+        for token in child.text.strip().split():
+            parts = token.split(",")
+            if len(parts) >= 2:
+                pts.append((float(parts[0]), float(parts[1])))
+        return pts
+    return []
+
+
+def _kml_path_length_km(kml_bytes: bytes) -> float:
+    """
+    Full river length along the KML from start → end.
+
+    - LineStrings: stitch multi-part lines, then measure full path
+    - Polygons: longer bank between farthest vertices (corridor length)
+    """
+    try:
+        root = ET.fromstring(kml_bytes)
+    except ET.ParseError:
+        return 0.0
+
+    lines: List[List[Tuple[float, float]]] = []
+    poly_lens: List[float] = []
+    for elem in root.iter():
+        tag = _local_name(elem.tag)
+        if tag == "LineString":
+            pts = _coords_from_element(elem)
+            if len(pts) >= 2:
+                lines.append(pts)
+        elif tag == "Polygon":
+            pts = _coords_from_element(elem)
+            if len(pts) >= 2:
+                poly_lens.append(_polygon_bank_length_km(pts))
+
+    best = max(poly_lens) if poly_lens else 0.0
+    if lines:
+        stitched = _stitch_polylines(lines)
+        best = max(best, _path_length_km(stitched), max(_path_length_km(L) for L in lines))
+        # Also allow sum when parts are separate stretches of one river
+        best = max(best, sum(_path_length_km(L) for L in lines))
+    return best
+
+
+def _centerline_length_km(
+    points: List[Tuple[float, float]],
+    axis_start: Tuple[float, float],
+    axis_end: Tuple[float, float],
+    span_km: float,
+    *,
+    bin_km: float = 0.25,
+) -> float:
+    """
+    Approx. river centerline length from a KML point cloud / polygon.
+
+    Points are binned along the axis; bin centroids are chained so meanders
+    count toward total km (unlike straight-line span alone).
+    """
+    if len(points) < 3 or span_km < 0.5:
+        return max(span_km, 0.0)
+    bins: dict[int, List[Tuple[float, float]]] = {}
+    for lon, lat in points:
+        c = _project_km_on_axis(lon, lat, axis_start, axis_end, span_km)
+        bins.setdefault(int(c / bin_km), []).append((lon, lat))
+    if len(bins) < 2:
+        return max(span_km, 0.0)
+    centers: List[Tuple[float, float]] = []
+    for key in sorted(bins):
+        pts = bins[key]
+        centers.append(
+            (
+                sum(p[0] for p in pts) / len(pts),
+                sum(p[1] for p in pts) / len(pts),
+            )
+        )
+    return max(_path_length_km(centers), span_km)
+
+
 def _axis_from_points(
     points: List[Tuple[float, float]],
 ) -> Tuple[Tuple[float, float], Tuple[float, float], float]:
@@ -479,6 +655,37 @@ def _project_km_on_axis(
 def _seed_from_centroid(lon: float, lat: float) -> int:
     raw = f"{round(lon, 4)}:{round(lat, 4)}".encode("utf-8")
     return int(hashlib.md5(raw).hexdigest()[:8], 16) % 90000 + 1000
+
+
+def _fmt_km(km: float) -> str:
+    return str(int(km)) if float(km).is_integer() else str(km)
+
+
+def _build_reaches_from_2km_chainage(
+    total_km: float,
+    *,
+    step_km: float = 2.0,
+) -> Tuple[List[Reach], List[Tuple[str, float]]]:
+    """Split the KML river axis into fixed 2 km chainage reaches: 0–2, 2–4, …"""
+    total = max(float(total_km), step_km)
+    n = max(1, int(math.ceil(total / step_km)))
+    reaches: List[Reach] = []
+    landmarks: List[Tuple[str, float]] = []
+    prev: Optional[str] = None
+    for i in range(n):
+        a = round(i * step_km, 2)
+        b = round(min((i + 1) * step_km, total), 2)
+        if b <= a:
+            b = round(a + step_km, 2)
+        name = f"{_fmt_km(a)}–{_fmt_km(b)} km"
+        rid = f"R{i + 1:02d}"
+        od = 0.35 + 0.5 * (i / max(1, n - 1))
+        r = Reach(rid, name, a, b, 70.0 + 5 * i, round(od, 2), upstream=prev)
+        r.villages = name  # type: ignore[attr-defined]
+        reaches.append(r)
+        landmarks.append((name, round((a + b) / 2.0, 2)))
+        prev = rid
+    return reaches, landmarks
 
 
 def _build_reaches_from_bridges(
@@ -580,7 +787,7 @@ def locate_kml(kml_bytes: bytes) -> KmlLocation:
     Build river profile from uploaded KML.
 
     Uses river name guessed from KML text (Document/Folder/placemark names).
-    Point placemarks are bridges for chainage, labeled B1, B2, B3… along the axis.
+    Chainage is fixed 2 km segments along the KML axis (0–2, 2–4, …).
     Synthetic demo seed is unique per centroid.
     """
     try:
@@ -602,29 +809,16 @@ def locate_kml(kml_bytes: bytes) -> KmlLocation:
     if not axis_pts:
         axis_pts = [(lon, lat)]
 
-    axis_start, axis_end, total_km = _axis_from_points(axis_pts)
-    if bridges:
-        # Recompute axis from ordered bridges when available
-        ordered = sorted(
-            bridges,
-            key=lambda b: _project_km_on_axis(
-                b[1], b[2], axis_start, axis_end, total_km
-            ),
-        )
-        axis_start = (ordered[0][1], ordered[0][2])
-        axis_end = (ordered[-1][1], ordered[-1][2])
-        total_km = max(
-            _haversine_km(axis_start[0], axis_start[1], axis_end[0], axis_end[1]),
-            0.5,
-        )
-        total_km = round(total_km, 2)
-    elif not bridges:
-        # No point bridges in KML — place B1..Bn along the river corridor axis
-        bridges = _sample_bridges_along_axis(axis_start, axis_end, total_km)
-
-    reaches, landmarks = _build_reaches_from_bridges(
-        bridges, axis_start, axis_end, total_km
-    )
+    axis_start, axis_end, span_km = _axis_from_points(axis_pts)
+    # Full KML length: stitched lines / polygon banks / meandering centerline
+    path_km = _kml_path_length_km(kml_bytes)
+    for ring in rings:
+        pts = [(float(p[0]), float(p[1])) for p in ring]
+        path_km = max(path_km, _polygon_bank_length_km(pts))
+    center_km = _centerline_length_km(axis_pts, axis_start, axis_end, span_km)
+    total_km = round(max(path_km, center_km, span_km, 0.5), 2)
+    # BOD/COD chainage: fixed 2 km reaches for this KML (0–2, 2–4, …)
+    reaches, landmarks = _build_reaches_from_2km_chainage(total_km)
     seed = _seed_from_centroid(lon, lat)
     holdout = reaches[len(reaches) // 2].reach_id
 

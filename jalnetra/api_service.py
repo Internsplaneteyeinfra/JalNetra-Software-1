@@ -73,7 +73,7 @@ RIVER_DASHBOARD_META: Dict[str, Dict[str, Any]] = {
         "landmarks": [],
         "demo_notice": (
             "CUSTOM RIVER SYNTHETIC DEMO — reaches and chainage from KML "
-            "bridge / placemark names. Figures validate software, not "
+            "as fixed 2 km segments (0–2, 2–4, …). Figures validate software, not "
             "real-world accuracy."
         ),
     },
@@ -365,6 +365,8 @@ def bod_cod_pipeline(kml_bytes: bytes) -> Tuple[Dict[str, Any], Dict[str, Any], 
             "area_name": location.area_name,
             "chainage_km": location.chainage_km,
             "km_range": list(location.km_range),
+            "total_km": location.profile.total_km,
+            "reach_count": len(location.profile.reaches_fn()),
             "villages": location.villages,
             "bridges": [
                 {"name": n, "chainage_km": km}

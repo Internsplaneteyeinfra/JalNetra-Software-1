@@ -362,8 +362,8 @@ async def bod_cod(
     """
     Upload KML → BOD/COD for that river (unique per KML).
 
-    River name and bridge / placemark names from the KML drive chainage and
-    reach labels. Returns live history, today's snapshot, 10-day forecast,
+    River name from the KML; chainage uses fixed 2 km segments (0–2, 2–4, …)
+    for that KML length. Returns live history, today's snapshot, 10-day forecast,
     and a dashboard_url for an HTML viewer titled for that river.
     """
     kml_bytes = await kml.read()
