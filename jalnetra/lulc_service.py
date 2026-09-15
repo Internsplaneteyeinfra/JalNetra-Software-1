@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import base64
 import math
+import random
+import time
 import urllib.request
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 from xml.dom import minidom
 
 import ee
@@ -20,6 +21,25 @@ from jalnetra.kml_buffer import (
     _geom_to_ee,
     _line_coords_for_kml,
     load_geometry_from_kml_bytes,
+)
+
+T = TypeVar("T")
+
+# Transient GEE / network failures (common under parallel getInfo load)
+_EE_TRANSIENT_MARKERS = (
+    "upstream",
+    "502",
+    "503",
+    "504",
+    "429",
+    "timeout",
+    "timed out",
+    "connection reset",
+    "unavailable",
+    "internal error",
+    "capacity",
+    "rate limit",
+    "please try again",
 )
 
 KML_NS = "http://www.opengis.net/kml/2.2"
@@ -50,6 +70,37 @@ LULC_PALETTE = ["006400", "E6A23C", "A9A9A9", "2196F3", "C62828"]
 
 ALPHA_EARTH = "GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL"
 DYNAMIC_WORLD = "GOOGLE/DYNAMICWORLD/V1"
+
+
+def _is_transient_ee_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(m in msg for m in _EE_TRANSIENT_MARKERS)
+
+
+def _with_ee_retry(
+    fn: Callable[[], T],
+    *,
+    retries: int = 4,
+    label: str = "EE",
+) -> T:
+    """Retry transient Earth Engine upstream / capacity errors with backoff."""
+    last: Optional[BaseException] = None
+    for attempt in range(retries):
+        try:
+            return fn()
+        except Exception as exc:
+            last = exc
+            if not _is_transient_ee_error(exc) or attempt >= retries - 1:
+                raise
+            delay = (2**attempt) + random.uniform(0.2, 1.0)
+            print(
+                f"[lulc] {label}: transient EE error "
+                f"(attempt {attempt + 1}/{retries}): {exc}; "
+                f"retrying in {delay:.1f}s"
+            )
+            time.sleep(delay)
+    assert last is not None
+    raise last
 
 
 def _polygon_coords_for_kml(geom) -> List[List[List[float]]]:
@@ -335,44 +386,67 @@ def _rf_classify(
     }
 
 
+def _classify_year_sentinel2(year: int, analysis_zone: ee.Geometry) -> Dict[str, Any]:
+    """Sentinel-2 RF path (used for 2026 and as AlphaEarth fallback)."""
+    features = _get_s2_features(year, analysis_zone)
+    try:
+        label = _make_dw_label(year, analysis_zone)
+    except ValueError:
+        # DW lag early in year — spectral pseudo-labels from S2 indices
+        ndvi = features.select("NDVI")
+        ndwi = features.select("NDWI")
+        mndwi = features.select("MNDWI")
+        ndbi = features.select("NDBI")
+        water = ndwi.gt(0.2).Or(mndwi.gt(0.1))
+        forest = ndvi.gt(0.55).And(water.Not())
+        crop = ndvi.gt(0.35).And(ndvi.lte(0.55)).And(water.Not())
+        settlement = ndbi.gt(0.0).And(ndvi.lt(0.3)).And(water.Not())
+        barren = water.Not().And(forest.Not()).And(crop.Not()).And(
+            settlement.Not()
+        )
+        valid = forest.Or(crop).Or(barren).Or(water).Or(settlement)
+        label = (
+            ee.Image(0)
+            .where(crop, 1)
+            .where(barren, 2)
+            .where(water, 3)
+            .where(settlement, 4)
+            .updateMask(valid)
+            .rename("lulc")
+            .clip(analysis_zone)
+            .toByte()
+        )
+    return _rf_classify(
+        features, label, year, analysis_zone, source="sentinel2"
+    )
+
+
 def _classify_year(year: int, analysis_zone: ee.Geometry) -> Dict[str, Any]:
     if year in S2_YEARS:
-        features = _get_s2_features(year, analysis_zone)
-        try:
-            label = _make_dw_label(year, analysis_zone)
-        except ValueError:
-            # DW lag early in year — spectral pseudo-labels from S2 indices
-            ndvi = features.select("NDVI")
-            ndwi = features.select("NDWI")
-            mndwi = features.select("MNDWI")
-            ndbi = features.select("NDBI")
-            water = ndwi.gt(0.2).Or(mndwi.gt(0.1))
-            forest = ndvi.gt(0.55).And(water.Not())
-            crop = ndvi.gt(0.35).And(ndvi.lte(0.55)).And(water.Not())
-            settlement = ndbi.gt(0.0).And(ndvi.lt(0.3)).And(water.Not())
-            barren = water.Not().And(forest.Not()).And(crop.Not()).And(
-                settlement.Not()
-            )
-            valid = forest.Or(crop).Or(barren).Or(water).Or(settlement)
-            label = (
-                ee.Image(0)
-                .where(crop, 1)
-                .where(barren, 2)
-                .where(water, 3)
-                .where(settlement, 4)
-                .updateMask(valid)
-                .rename("lulc")
-                .clip(analysis_zone)
-                .toByte()
-            )
+        return _classify_year_sentinel2(year, analysis_zone)
+
+    def _alpha_path() -> Dict[str, Any]:
+        label = _make_dw_label(year, analysis_zone)
+        alpha = _get_alpha(year, analysis_zone)
         return _rf_classify(
-            features, label, year, analysis_zone, source="sentinel2"
+            alpha, label, year, analysis_zone, source="alphaearth"
         )
-    label = _make_dw_label(year, analysis_zone)
-    alpha = _get_alpha(year, analysis_zone)
-    return _rf_classify(
-        alpha, label, year, analysis_zone, source="alphaearth"
-    )
+
+    try:
+        return _with_ee_retry(
+            _alpha_path, retries=3, label=f"LULC AlphaEarth {year}"
+        )
+    except Exception as exc:
+        # Missing AlphaEarth layer or persistent upstream → Sentinel-2 fallback
+        print(
+            f"[lulc] AlphaEarth {year} failed ({exc}); "
+            f"falling back to Sentinel-2 RF"
+        )
+        return _with_ee_retry(
+            lambda: _classify_year_sentinel2(year, analysis_zone),
+            retries=3,
+            label=f"LULC Sentinel-2 {year}",
+        )
 
 
 def _lulc_vis_image(classified: ee.Image, analysis_area: ee.Geometry) -> ee.Image:
@@ -500,7 +574,11 @@ def _build_year_result(
     categories = []
     for cls in LULC_CLASSES:
         cid = int(cls["id"])
-        ha = _class_area_ha(classified, cid, geometry)
+        ha = _with_ee_retry(
+            lambda c=cid: _class_area_ha(classified, c, geometry),
+            retries=3,
+            label=f"LULC area class {cid} {year}",
+        )
         categories.append(
             {
                 "id": cid,
@@ -513,7 +591,11 @@ def _build_year_result(
 
     vis = _lulc_vis_image(classified, geometry)
     export_scale_m = _export_scale_for_geometry(geometry)
-    png = _export_overlay_png(vis, geometry)
+    png = _with_ee_retry(
+        lambda: _export_overlay_png(vis, geometry),
+        retries=3,
+        label=f"LULC PNG {year}",
+    )
     legend = [f"{c['color']}  {c['name']}" for c in LULC_CLASSES]
 
     buf_desc = ""
@@ -584,25 +666,19 @@ def analyze_lulc(
     yearly: Dict[str, Dict[str, Any]] = {}
     errors: Dict[str, str] = {}
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {
-            pool.submit(
-                _build_year_result,
+    # Sequential years — parallel getInfo() commonly triggers EE "Upstream error"
+    for year in VALID_YEARS:
+        key = str(year)
+        try:
+            yearly[key] = _build_year_result(
                 analysis_area,
                 year,
                 analysis_area_ha=analysis_area_ha,
                 box=box,
                 buffer_info=buffer_info,
-            ): year
-            for year in VALID_YEARS
-        }
-        for future in as_completed(futures):
-            year = futures[future]
-            key = str(year)
-            try:
-                yearly[key] = future.result()
-            except Exception as exc:
-                errors[key] = str(exc)
+            )
+        except Exception as exc:
+            errors[key] = str(exc)
 
     years_out: Dict[str, Any] = {}
     for year in VALID_YEARS:
@@ -632,6 +708,10 @@ def analyze_lulc(
         "notes": {
             "default_years": "Years are fixed to 2021–2026 (no year input).",
             "year_2026": "Sentinel-2 median + RF (AlphaEarth not required).",
+            "alphaearth_fallback": (
+                "If AlphaEarth/upstream fails for 2021–2025, that year "
+                "falls back to Sentinel-2 RF automatically."
+            ),
             "smoothing": (
                 "Light focal_mode + 5 m export grid for smooth class edges "
                 "without square stairs or heavy blur."
