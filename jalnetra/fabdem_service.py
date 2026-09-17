@@ -133,19 +133,65 @@ def _download_byte_range(
     raise last_exc
 
 
-def _read_remote_zip_index(session: Session, url: str) -> Dict[str, Dict[str, int]]:
-    file_size, supports_ranges = _head_file(session, url)
-    if not file_size:
-        raise ValueError("Could not determine remote ZIP file size.")
-    if not supports_ranges:
-        raise ValueError(
-            "FABDEM host does not support HTTP Range requests; "
-            "cannot safely download multi-GB archives on Railway."
-        )
+def _parse_zip64_extra(
+    extra: bytes,
+    *,
+    uncompressed_size: int,
+    compressed_size: int,
+    local_header_offset: int,
+    disk_start: int = 0,
+) -> Tuple[int, int, int, int]:
+    """
+    Resolve 0xFFFFFFFF / 0xFFFF placeholders from ZIP64 extra field (0x0001).
 
-    tail_size = min(file_size, 131072)
-    tail_start = file_size - tail_size
-    tail_bytes = _download_byte_range(session, url, tail_start, file_size - 1)
+    Large FABDEM archives (e.g. N20E090…) store real local-header offsets in
+    ZIP64 extras; treating 0xFFFFFFFF as a real offset causes HTTP 416.
+    """
+    pos = 0
+    while pos + 4 <= len(extra):
+        header_id, data_size = struct.unpack_from("<HH", extra, pos)
+        pos += 4
+        if pos + data_size > len(extra):
+            break
+        data = extra[pos : pos + data_size]
+        pos += data_size
+        if header_id != 0x0001:
+            continue
+        o = 0
+        if uncompressed_size == 0xFFFFFFFF:
+            if o + 8 > len(data):
+                raise ValueError("Truncated ZIP64 uncompressed size.")
+            uncompressed_size = struct.unpack_from("<Q", data, o)[0]
+            o += 8
+        if compressed_size == 0xFFFFFFFF:
+            if o + 8 > len(data):
+                raise ValueError("Truncated ZIP64 compressed size.")
+            compressed_size = struct.unpack_from("<Q", data, o)[0]
+            o += 8
+        if local_header_offset == 0xFFFFFFFF:
+            if o + 8 > len(data):
+                raise ValueError("Truncated ZIP64 local header offset.")
+            local_header_offset = struct.unpack_from("<Q", data, o)[0]
+            o += 8
+        if disk_start == 0xFFFF:
+            if o + 4 > len(data):
+                raise ValueError("Truncated ZIP64 disk start.")
+            disk_start = struct.unpack_from("<I", data, o)[0]
+        break
+    return uncompressed_size, compressed_size, local_header_offset, disk_start
+
+
+def _read_eocd_offsets(tail_bytes: bytes) -> Tuple[int, int, int]:
+    """Return (central_dir_offset, central_dir_size, total_entries) from ZIP tail."""
+    # Prefer ZIP64 EOCD locator when present (PK\\x06\\x07)
+    zip64_loc = tail_bytes.rfind(b"PK\x06\x07")
+    if zip64_loc != -1 and zip64_loc + 20 <= len(tail_bytes):
+        _sig, _disk, zip64_eocd_offset, _disks = struct.unpack_from(
+            "<4sIQI", tail_bytes, zip64_loc
+        )
+        # Locator alone is not enough if ZIP64 EOCD is outside this tail; fall
+        # through to classic EOCD and let callers fetch a larger window if needed.
+        _ = zip64_eocd_offset
 
     signature = b"PK\x05\x06"
     index = tail_bytes.rfind(signature)
@@ -166,10 +212,69 @@ def _read_remote_zip_index(session: Session, url: str) -> Dict[str, Dict[str, in
 
     if disk_number != 0 or central_dir_disk_number != 0:
         raise ValueError("Multi-disk ZIP archives are not supported.")
-    if disk_entries != total_entries:
+    if disk_entries != total_entries and total_entries != 0xFFFF:
         raise ValueError("ZIP archive spans multiple disks and is not supported.")
-    if central_dir_offset == 0xFFFFFFFF or central_dir_size == 0xFFFFFFFF:
-        raise ValueError("ZIP64 archives are not supported.")
+
+    # ZIP64 EOCD record (PK\\x06\\x06) when classic fields are overflowed
+    if (
+        central_dir_offset == 0xFFFFFFFF
+        or central_dir_size == 0xFFFFFFFF
+        or total_entries == 0xFFFF
+    ):
+        zip64_eocd = tail_bytes.rfind(b"PK\x06\x06")
+        if zip64_eocd == -1:
+            raise ValueError(
+                "ZIP64 end of central directory required but not found in file tail."
+            )
+        # After sig(4) + size(8) + version made(2) + version needed(2):
+        # disk(4), cd_disk(4), disk_entries(8), total_entries(8), cd_size(8), cd_offset(8)
+        (
+            _zsig,
+            _zsize,
+            _vmade,
+            _vneed,
+            _zdisk,
+            _zcd_disk,
+            _zdisk_entries,
+            total_entries64,
+            central_dir_size64,
+            central_dir_offset64,
+        ) = struct.unpack_from("<4sQHHIIQQQQ", tail_bytes, zip64_eocd)
+        if central_dir_offset == 0xFFFFFFFF:
+            central_dir_offset = central_dir_offset64
+        if central_dir_size == 0xFFFFFFFF:
+            central_dir_size = central_dir_size64
+        if total_entries == 0xFFFF:
+            total_entries = total_entries64
+
+    return int(central_dir_offset), int(central_dir_size), int(total_entries)
+
+
+def _read_remote_zip_index(session: Session, url: str) -> Dict[str, Dict[str, int]]:
+    file_size, supports_ranges = _head_file(session, url)
+    if not file_size:
+        raise ValueError("Could not determine remote ZIP file size.")
+    if not supports_ranges:
+        raise ValueError(
+            "FABDEM host does not support HTTP Range requests; "
+            "cannot safely download multi-GB archives on Railway."
+        )
+
+    # Larger tail so ZIP64 EOCD + classic EOCD both fit for multi-GB archives
+    tail_size = min(file_size, 256 * 1024)
+    tail_start = file_size - tail_size
+    tail_bytes = _download_byte_range(session, url, tail_start, file_size - 1)
+
+    central_dir_offset, central_dir_size, _total_entries = _read_eocd_offsets(
+        tail_bytes
+    )
+    if central_dir_offset < 0 or central_dir_size <= 0:
+        raise ValueError("Invalid ZIP central directory offsets.")
+    if central_dir_offset + central_dir_size > file_size:
+        raise ValueError(
+            f"ZIP central directory exceeds file size "
+            f"(offset={central_dir_offset}, size={central_dir_size}, file={file_size})."
+        )
 
     central_directory = _download_byte_range(
         session,
@@ -198,7 +303,7 @@ def _read_remote_zip_index(session: Session, url: str) -> Dict[str, Dict[str, in
             filename_length,
             extra_length,
             comment_length,
-            _disk_start,
+            disk_start,
             _internal_attributes,
             _external_attributes,
             local_header_offset,
@@ -206,16 +311,47 @@ def _read_remote_zip_index(session: Session, url: str) -> Dict[str, Dict[str, in
 
         filename_start = offset + 46
         filename_end = filename_start + filename_length
+        extra_end = filename_end + extra_length
+        comment_end = extra_end + comment_length
         filename = central_directory[filename_start:filename_end].decode("utf-8")
+        extra = central_directory[filename_end:extra_end]
+
+        if (
+            uncompressed_size == 0xFFFFFFFF
+            or compressed_size == 0xFFFFFFFF
+            or local_header_offset == 0xFFFFFFFF
+            or disk_start == 0xFFFF
+        ):
+            (
+                uncompressed_size,
+                compressed_size,
+                local_header_offset,
+                disk_start,
+            ) = _parse_zip64_extra(
+                extra,
+                uncompressed_size=uncompressed_size,
+                compressed_size=compressed_size,
+                local_header_offset=local_header_offset,
+                disk_start=disk_start,
+            )
+
+        if local_header_offset == 0xFFFFFFFF or local_header_offset >= file_size:
+            raise ValueError(
+                f"Invalid local header offset for {filename}: {local_header_offset} "
+                f"(file size {file_size}). ZIP64 extra field missing or corrupt."
+            )
+        if compressed_size <= 0:
+            raise ValueError(f"Invalid compressed size for {filename}: {compressed_size}")
+
         entries[filename] = {
             "flags": flags,
             "compression_method": compression_method,
             "crc32": crc32,
-            "compressed_size": compressed_size,
-            "uncompressed_size": uncompressed_size,
-            "local_header_offset": local_header_offset,
+            "compressed_size": int(compressed_size),
+            "uncompressed_size": int(uncompressed_size),
+            "local_header_offset": int(local_header_offset),
         }
-        offset = filename_end + extra_length + comment_length
+        offset = comment_end
 
     return entries
 
@@ -254,6 +390,13 @@ def _extract_remote_zip_member(
 
     data_start = local_header_offset + 30 + filename_length + extra_length
     data_end = data_start + entry["compressed_size"] - 1
+    # Guard against bad ZIP64 / CDN length mismatches
+    file_size, _ = _head_file(session, url)
+    if data_start < 0 or data_end >= file_size or data_end < data_start:
+        raise ValueError(
+            f"Computed byte range {data_start}-{data_end} is outside file "
+            f"(size={file_size}) for {member_name}."
+        )
     compressed_data = _download_byte_range(session, url, data_start, data_end)
 
     if compression_method == 0:
