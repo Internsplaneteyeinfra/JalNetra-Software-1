@@ -6,17 +6,381 @@ Port of the FABDEM KML DTM downloader script:
   2) download FABDEM for KML bounding box
   3) clip raster to exact KML geometry
   4) return clipped GeoTIFF bytes
+
+Production note:
+  The public ``fabdem`` package falls back to downloading whole ZIP archives
+  (often 1–2 GB). On Railway that commonly yields a truncated / HTML body and
+  then ``BadZipFile: File is not a zip file``. This module downloads only the
+  required TIFF members via HTTP Range requests and validates ZIP/TIFF magic.
 """
 from __future__ import annotations
 
+import logging
+import struct
 import tempfile
+import zlib
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import fabdem
 import geopandas as gpd
-from rasterio.mask import mask
 import rasterio
+import rasterio.merge
+import requests
+import shapely.geometry
+from rasterio.mask import mask
+from requests import Session
+
+logger = logging.getLogger(__name__)
+
+FABDEM_BASE_URL = "https://data.bris.ac.uk/datasets/s5hqmjcdj8yo2ibzi9b4ew3sn"
+TILES_GEOJSON = f"{FABDEM_BASE_URL}/FABDEM_v1-2_tiles.geojson"
+USER_AGENT = (
+    "JalNetra-FABDEM/1.0 (+https://github.com/planeteyeai/JalNetra-Software; "
+    "mailto:support@planeteye.ai)"
+)
+REQUEST_TIMEOUT = (30, 600)  # connect, read
+MAX_RETRIES = 3
+
+
+def _session() -> Session:
+    s = Session()
+    s.headers.update(
+        {
+            "User-Agent": USER_AGENT,
+            "Accept": "*/*",
+        }
+    )
+    return s
+
+
+def _purge_invalid_cache(cache_dir: Path) -> List[str]:
+    """Remove non-ZIP / truncated archives that poison subsequent runs."""
+    removed: List[str] = []
+    if not cache_dir.exists():
+        return removed
+    for path in cache_dir.glob("*.zip"):
+        try:
+            with open(path, "rb") as fh:
+                magic = fh.read(4)
+            if magic[:2] != b"PK":
+                path.unlink(missing_ok=True)
+                removed.append(path.name)
+                continue
+            # Tiny files cannot be real FABDEM zips (multi-hundred MB+)
+            if path.stat().st_size < 1024 * 1024:
+                path.unlink(missing_ok=True)
+                removed.append(path.name)
+        except OSError:
+            continue
+    return removed
+
+
+def _correct_tile_name(json_name: str) -> str:
+    # FABDEM_v1-2_tiles.geojson north/south labels have an extra zero.
+    return json_name[0] + json_name[2:]
+
+
+def _normalize_zip_name(name: str) -> str:
+    return name.replace("S-", "S").replace("N-", "N")
+
+
+def _head_file(session: Session, url: str) -> Tuple[int, bool]:
+    response = session.head(url, allow_redirects=True, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    file_size = int(response.headers.get("content-length", 0))
+    accept_ranges = response.headers.get("accept-ranges", "")
+    return file_size, "bytes" in accept_ranges.lower()
+
+
+def _download_byte_range(
+    session: Session, url: str, start: int, end: int
+) -> bytes:
+    last_exc: Optional[BaseException] = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = session.get(
+                url,
+                headers={"Range": f"bytes={start}-{end}"},
+                stream=True,
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            if response.status_code != 206:
+                raise ValueError(
+                    f"Server did not return HTTP 206 for range {start}-{end} "
+                    f"(got {response.status_code})."
+                )
+            chunks: List[bytes] = []
+            for chunk in response.iter_content(chunk_size=1024 * 64):
+                if chunk:
+                    chunks.append(chunk)
+            data = b"".join(chunks)
+            expected = end - start + 1
+            if len(data) != expected:
+                raise ValueError(
+                    f"Incomplete range download ({len(data)}/{expected} bytes)."
+                )
+            return data
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "FABDEM range download attempt %d/%d failed: %s",
+                attempt + 1,
+                MAX_RETRIES,
+                exc,
+            )
+    assert last_exc is not None
+    raise last_exc
+
+
+def _read_remote_zip_index(session: Session, url: str) -> Dict[str, Dict[str, int]]:
+    file_size, supports_ranges = _head_file(session, url)
+    if not file_size:
+        raise ValueError("Could not determine remote ZIP file size.")
+    if not supports_ranges:
+        raise ValueError(
+            "FABDEM host does not support HTTP Range requests; "
+            "cannot safely download multi-GB archives on Railway."
+        )
+
+    tail_size = min(file_size, 131072)
+    tail_start = file_size - tail_size
+    tail_bytes = _download_byte_range(session, url, tail_start, file_size - 1)
+
+    signature = b"PK\x05\x06"
+    index = tail_bytes.rfind(signature)
+    if index == -1:
+        raise ValueError("ZIP end of central directory record not found.")
+
+    eocd = tail_bytes[index : index + 22]
+    (
+        _sig,
+        disk_number,
+        central_dir_disk_number,
+        disk_entries,
+        total_entries,
+        central_dir_size,
+        central_dir_offset,
+        _comment_length,
+    ) = struct.unpack("<4s4H2LH", eocd)
+
+    if disk_number != 0 or central_dir_disk_number != 0:
+        raise ValueError("Multi-disk ZIP archives are not supported.")
+    if disk_entries != total_entries:
+        raise ValueError("ZIP archive spans multiple disks and is not supported.")
+    if central_dir_offset == 0xFFFFFFFF or central_dir_size == 0xFFFFFFFF:
+        raise ValueError("ZIP64 archives are not supported.")
+
+    central_directory = _download_byte_range(
+        session,
+        url,
+        central_dir_offset,
+        central_dir_offset + central_dir_size - 1,
+    )
+
+    entries: Dict[str, Dict[str, int]] = {}
+    offset = 0
+    while offset < len(central_directory):
+        if central_directory[offset : offset + 4] != b"PK\x01\x02":
+            raise ValueError("Invalid ZIP central directory entry.")
+        header = central_directory[offset : offset + 46]
+        (
+            _signature,
+            _version_made_by,
+            _version_needed,
+            flags,
+            compression_method,
+            _mod_time,
+            _mod_date,
+            crc32,
+            compressed_size,
+            uncompressed_size,
+            filename_length,
+            extra_length,
+            comment_length,
+            _disk_start,
+            _internal_attributes,
+            _external_attributes,
+            local_header_offset,
+        ) = struct.unpack("<4s6H3L5H2L", header)
+
+        filename_start = offset + 46
+        filename_end = filename_start + filename_length
+        filename = central_directory[filename_start:filename_end].decode("utf-8")
+        entries[filename] = {
+            "flags": flags,
+            "compression_method": compression_method,
+            "crc32": crc32,
+            "compressed_size": compressed_size,
+            "uncompressed_size": uncompressed_size,
+            "local_header_offset": local_header_offset,
+        }
+        offset = filename_end + extra_length + comment_length
+
+    return entries
+
+
+def _extract_remote_zip_member(
+    session: Session,
+    url: str,
+    entries: Dict[str, Dict[str, int]],
+    member_name: str,
+    destination_path: Path,
+) -> None:
+    if member_name not in entries:
+        raise FileNotFoundError(f"ZIP member not found: {member_name}")
+
+    entry = entries[member_name]
+    local_header_offset = entry["local_header_offset"]
+    local_header = _download_byte_range(
+        session, url, local_header_offset, local_header_offset + 29
+    )
+    if local_header[:4] != b"PK\x03\x04":
+        raise ValueError("Invalid ZIP local file header.")
+
+    (
+        _signature,
+        _version_needed,
+        _flags,
+        compression_method,
+        _mod_time,
+        _mod_date,
+        _crc32,
+        _compressed_size,
+        _uncompressed_size,
+        filename_length,
+        extra_length,
+    ) = struct.unpack("<4s5H3L2H", local_header)
+
+    data_start = local_header_offset + 30 + filename_length + extra_length
+    data_end = data_start + entry["compressed_size"] - 1
+    compressed_data = _download_byte_range(session, url, data_start, data_end)
+
+    if compression_method == 0:
+        data = compressed_data
+    elif compression_method == 8:
+        data = zlib.decompress(compressed_data, -zlib.MAX_WBITS)
+    else:
+        raise ValueError(f"Unsupported ZIP compression method: {compression_method}")
+
+    # GeoTIFF magic: little-endian II*\0 or big-endian MM\0*
+    if len(data) < 4 or data[:2] not in (b"II", b"MM"):
+        raise ValueError(
+            f"Extracted member {member_name} is not a TIFF "
+            f"(got magic={data[:8]!r})."
+        )
+
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination_path.with_suffix(destination_path.suffix + ".part")
+    tmp_path.write_bytes(data)
+    tmp_path.replace(destination_path)
+
+
+def _merge_rasters(
+    output_path: Path, tiles: List[Path], bounds: Tuple[float, float, float, float]
+) -> None:
+    rasters = [rasterio.open(tile) for tile in tiles]
+    try:
+        merged_raster, merged_transform = rasterio.merge.merge(rasters, bounds=bounds)
+        source_crs = rasters[0].crs
+        if source_crs is None:
+            raise ValueError("No CRS present in FABDEM tile metadata.")
+        metadata = {
+            "count": merged_raster.shape[0],
+            "height": merged_raster.shape[1],
+            "width": merged_raster.shape[2],
+            "dtype": merged_raster.dtype,
+            "crs": source_crs,
+            "transform": merged_transform,
+        }
+        with rasterio.open(output_path, mode="w", **metadata) as dest:
+            dest.write(merged_raster)
+    finally:
+        for raster in rasters:
+            raster.close()
+
+
+def _download_fabdem_for_bounds(
+    bounds: Tuple[float, float, float, float],
+    output_path: Path,
+    cache_dir: Path,
+) -> Dict[str, Any]:
+    """Download only intersecting TIFF tiles via HTTP Range (no full ZIP)."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    purged = _purge_invalid_cache(cache_dir)
+    if purged:
+        logger.warning("Purged invalid FABDEM cache zip(s): %s", ", ".join(purged))
+
+    rect = shapely.geometry.box(*bounds)
+
+    with _session() as session:
+        response = session.get(TILES_GEOJSON, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        tiles_gdf = gpd.GeoDataFrame.from_features(
+            response.json()["features"], crs=4326
+        )
+        intersecting = tiles_gdf[tiles_gdf.geometry.intersects(rect)]
+        if intersecting.empty:
+            raise RuntimeError(
+                "No FABDEM tiles intersect the uploaded KML bounding box."
+            )
+
+        grouped: Dict[str, List[str]] = {}
+        for row in intersecting.itertuples():
+            zip_name = _normalize_zip_name(row.zipfile_name)
+            member = _correct_tile_name(row.file_name)
+            grouped.setdefault(zip_name, []).append(member)
+
+        zip_index_cache: Dict[str, Dict[str, Dict[str, int]]] = {}
+        for zip_name, member_names in grouped.items():
+            tile_url = f"{FABDEM_BASE_URL}/{zip_name}"
+            for member_name in member_names:
+                dest = cache_dir / member_name
+                if dest.exists() and dest.stat().st_size > 1024:
+                    # Quick TIFF magic check
+                    with open(dest, "rb") as fh:
+                        if fh.read(2) in (b"II", b"MM"):
+                            continue
+                    dest.unlink(missing_ok=True)
+
+                if tile_url not in zip_index_cache:
+                    zip_index_cache[tile_url] = _read_remote_zip_index(
+                        session, tile_url
+                    )
+                try:
+                    _extract_remote_zip_member(
+                        session,
+                        tile_url,
+                        zip_index_cache[tile_url],
+                        member_name,
+                        dest,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to extract FABDEM tile {member_name} from "
+                        f"{zip_name}: {exc}. "
+                        "The Bristol data host may be slow/unreachable from "
+                        "Railway, or the response was not a valid ZIP member."
+                    ) from exc
+
+        tile_paths = [
+            cache_dir / _correct_tile_name(name)
+            for name in intersecting.file_name
+        ]
+        missing = [p for p in tile_paths if not p.exists()]
+        if missing:
+            raise RuntimeError(
+                "FABDEM tile download incomplete: "
+                + ", ".join(p.name for p in missing)
+            )
+
+        _merge_rasters(output_path, tile_paths, bounds)
+        return {
+            "tile_count": len(tile_paths),
+            "zip_count": len(grouped),
+            "zip_names": sorted(grouped.keys()),
+            "cache_purged": purged,
+        }
 
 
 def download_fabdem_dtm_from_kml(kml_bytes: bytes) -> Dict[str, Any]:
@@ -47,7 +411,7 @@ def download_fabdem_dtm_from_kml(kml_bytes: bytes) -> Dict[str, Any]:
         # ---- read KML ----
         try:
             aoi = gpd.read_file(kml_path, driver="KML")
-        except Exception as error:
+        except Exception:
             # Fallback without explicit driver (pyogrio / fiona auto)
             try:
                 aoi = gpd.read_file(kml_path)
@@ -70,16 +434,22 @@ def download_fabdem_dtm_from_kml(kml_bytes: bytes) -> Dict[str, Any]:
         # ---- merge geometries + bbox ----
         aoi_geometry = aoi.geometry.union_all()
         west, south, east, north = aoi_geometry.bounds
+        bounds = (float(west), float(south), float(east), float(north))
 
-        # ---- FABDEM download ----
+        # ---- FABDEM download (range-only; never full multi-GB ZIP) ----
         try:
-            fabdem.download(
-                (west, south, east, north),
-                output_path=str(temp_file),
-                cache=cache_dir,
-                show_progress=False,
-            )
+            dl_meta = _download_fabdem_for_bounds(bounds, temp_file, cache_dir)
         except Exception as error:
+            msg = str(error)
+            if "not a zip file" in msg.lower() or "BadZipFile" in type(error).__name__:
+                raise RuntimeError(
+                    "FABDEM download failed: received a non-ZIP response "
+                    "(often a truncated download or HTML error page). "
+                    "India tiles sit in ~1.3 GB archives; this API now pulls "
+                    "only the needed TIFF via HTTP Range. Retry the request; "
+                    f"if it persists, Bristol host may be blocking Railway. "
+                    f"Detail: {error}"
+                ) from error
             raise RuntimeError(f"FABDEM download failed: {error}") from error
 
         if not temp_file.exists():
@@ -119,8 +489,13 @@ def download_fabdem_dtm_from_kml(kml_bytes: bytes) -> Dict[str, Any]:
             "height": int(clipped.shape[1]),
             "tif_filename": "FABDEM_DTM_KML_Clipped.tif",
             "tif_bytes": tif_bytes,
+            "download": dl_meta,
             "notes": {
                 "source": "FABDEM (Forest And Buildings removed Copernicus DEM)",
                 "clip": "Clipped to exact uploaded KML geometry (not only bbox).",
+                "method": (
+                    "HTTP Range extraction of required TIFF members only "
+                    "(avoids full multi-GB ZIP download that fails on Railway)."
+                ),
             },
         }
