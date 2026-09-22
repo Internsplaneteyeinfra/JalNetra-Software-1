@@ -56,6 +56,9 @@ from jalnetra.fishing_point_service import (  # noqa: E402
     fishing_point_geometry,
 )
 from jalnetra.fabdem_service import download_fabdem_dtm_from_kml  # noqa: E402
+from jalnetra.copernicus_dsm_service import (  # noqa: E402
+    download_copernicus_dsm_from_kml,
+)
 from jalnetra.water_quality_service import (  # noqa: E402
     analyze_water_quality,
     water_quality_geometry,
@@ -244,7 +247,8 @@ async def root() -> Dict[str, Any]:
             "POST /api/vegetation-type, POST /api/vegetation-health, "
             "POST /api/lulc, POST /api/salinity, POST /api/bank-erosion, "
             "POST /api/water-quality, POST /api/lithology, POST /api/silt, "
-            "POST /api/fishing-point, POST /api/fabdem-dtm"
+            "POST /api/fishing-point, POST /api/fabdem-dtm, "
+            "POST /api/copernicus-dsm"
         ),
         "ngrok_free_tier": (
             "Browser: click 'Visit Site' once on the ngrok warning page, then use /docs. "
@@ -1103,6 +1107,62 @@ async def download_fabdem_dtm_tif(tif_id: str) -> Response:
         headers={
             "Content-Disposition": (
                 'attachment; filename="FABDEM_DTM_KML_Clipped.tif"'
+            )
+        },
+    )
+
+
+@app.post("/api/copernicus-dsm")
+async def copernicus_dsm(
+    request: Request,
+    kml: UploadFile = File(..., description="KML AOI boundary"),
+) -> Dict[str, Any]:
+    """
+    Upload KML → download Copernicus GLO-30 DSM for the KML bbox, clip to
+    exact KML geometry, and return a GeoTIFF download URL (open in QGIS).
+
+    Digital Surface Model (includes buildings / vegetation). No Earth Engine.
+    """
+    kml_bytes = await kml.read()
+    if not kml_bytes:
+        raise HTTPException(status_code=400, detail="KML file is empty.")
+
+    try:
+        result = await asyncio.to_thread(
+            download_copernicus_dsm_from_kml, kml_bytes
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Copernicus DSM failed: {exc}"
+        ) from exc
+
+    tif_id = uuid.uuid4().hex
+    _TIF_CACHE[tif_id] = result.pop("tif_bytes")
+    result["tif_id"] = tif_id
+    result["tif_download_url"] = _public_url(
+        request, f"/api/copernicus-dsm/tif/{tif_id}"
+    )
+    return result
+
+
+@app.get("/api/copernicus-dsm/tif/{tif_id}")
+async def download_copernicus_dsm_tif(tif_id: str) -> Response:
+    tif_bytes = _TIF_CACHE.get(tif_id)
+    if tif_bytes is None:
+        raise HTTPException(
+            status_code=404,
+            detail="TIFF not found or expired. Run POST /api/copernicus-dsm again.",
+        )
+    return Response(
+        content=tif_bytes,
+        media_type="image/tiff",
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="Copernicus_DSM_KML_Clipped.tif"'
             )
         },
     )
