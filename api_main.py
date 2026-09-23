@@ -68,6 +68,7 @@ from jalnetra.vegetation_service import (  # noqa: E402
     analyze_vegetation_type,
     default_date_range,
 )
+from jalnetra.kml_pixel_smoother import smooth_kml_bytes  # noqa: E402
 
 _DASHBOARD_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
 _EXCEL_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
@@ -267,13 +268,23 @@ async def health() -> Dict[str, Any]:
     }
 
 
+def _store_smoothed_kml(kml_bytes: bytes) -> str:
+    """Cache KML after coverage-aware pixel smoothing (GroundOverlay PNG only)."""
+    kml_id = uuid.uuid4().hex
+    try:
+        _KML_CACHE[kml_id] = smooth_kml_bytes(kml_bytes)
+    except Exception:
+        # Never break API downloads if smoothing fails — serve original KML.
+        _KML_CACHE[kml_id] = kml_bytes
+    return kml_id
+
+
 def _flood_water_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
     """Attach one KML download URL per image date."""
     datewise_out: List[Dict[str, Any]] = []
     for entry in result.get("datewise") or []:
         row = {k: v for k, v in entry.items() if k != "kml_bytes"}
-        kml_id = uuid.uuid4().hex
-        _KML_CACHE[kml_id] = entry["kml_bytes"]
+        kml_id = _store_smoothed_kml(entry["kml_bytes"])
         row["kml_id"] = kml_id
         row["kml_download_url"] = _public_url(
             request, f"/api/flood-water/kml/{kml_id}"
@@ -448,8 +459,7 @@ def _kml_geometry_from_bytes(kml_bytes: bytes):
 def _vegetation_response(
     request: Request, result: Dict[str, Any], *, prefix: str, filename: str
 ) -> Dict[str, Any]:
-    kml_id = uuid.uuid4().hex
-    _KML_CACHE[kml_id] = result.pop("kml_bytes")
+    kml_id = _store_smoothed_kml(result.pop("kml_bytes"))
     result["kml_id"] = kml_id
     result["kml_download_url"] = _public_url(
         request, f"/api/{prefix}/kml/{kml_id}"
@@ -467,8 +477,7 @@ def _water_quality_response(request: Request, result: Dict[str, Any]) -> Dict[st
         "ndci": ("ndci_kml_bytes", "ndci_chlorophyll.kml"),
     }
     for layer_key, (bytes_key, filename) in layers.items():
-        kml_id = uuid.uuid4().hex
-        _KML_CACHE[kml_id] = result.pop(bytes_key)
+        kml_id = _store_smoothed_kml(result.pop(bytes_key))
         result[layer_key]["kml_id"] = kml_id
         result[layer_key]["kml_download_url"] = _public_url(
             request, f"/api/water-quality/kml/{kml_id}"
@@ -484,8 +493,7 @@ def _silt_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
         if bytes_key not in result:
             continue
         filename = result["months"][key].get("kml_filename", f"silt_{key}.kml")
-        kml_id = uuid.uuid4().hex
-        _KML_CACHE[kml_id] = result.pop(bytes_key)
+        kml_id = _store_smoothed_kml(result.pop(bytes_key))
         result["months"][key]["kml_id"] = kml_id
         result["months"][key]["kml_download_url"] = _public_url(
             request, f"/api/silt/kml/{kml_id}"
@@ -502,8 +510,7 @@ def _lulc_response(request: Request, result: Dict[str, Any]) -> Dict[str, Any]:
         if bytes_key not in result:
             continue
         filename = result["years"][year_key].get("kml_filename", f"lulc_{year}.kml")
-        kml_id = uuid.uuid4().hex
-        _KML_CACHE[kml_id] = result.pop(bytes_key)
+        kml_id = _store_smoothed_kml(result.pop(bytes_key))
         result["years"][year_key]["kml_id"] = kml_id
         result["years"][year_key]["kml_download_url"] = _public_url(
             request, f"/api/lulc/kml/{kml_id}"
