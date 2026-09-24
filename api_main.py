@@ -69,6 +69,7 @@ from jalnetra.vegetation_service import (  # noqa: E402
     default_date_range,
 )
 from jalnetra.kml_pixel_smoother import smooth_kml_bytes  # noqa: E402
+from jalnetra.water_depth_service import analyze_live_water_depth
 
 _DASHBOARD_CACHE: TTLCache = TTLCache(maxsize=50, ttl=3600)
 _EXCEL_CACHE: TTLCache = TTLCache(maxsize=200, ttl=3600)
@@ -887,6 +888,43 @@ async def download_water_quality_kml(kml_id: str) -> Response:
         content=kml_bytes,
         media_type="application/vnd.google-earth.kml+xml",
         headers={"Content-Disposition": 'attachment; filename="water_quality.kml"'},
+    )
+@app.post("/api/water-depth")
+async def water_depth(
+    request: Request,
+    kml: UploadFile = File(..., description="KML file with water/river boundary"),
+) -> Dict[str, Any]:
+    """Upload KML -> live Sentinel-1 water + Sentinel-2 relative depth KML."""
+    _require_earth_engine()
+    kml_bytes = await kml.read()
+    if not kml_bytes:
+        raise HTTPException(status_code=400, detail="KML file is empty.")
+    try:
+        from jalnetra.flood_deps.kml_utils import parse_kml_plots, plots_to_combined_geometry
+        plots = parse_kml_plots(kml_bytes)
+        geometry = plots_to_combined_geometry(plots)
+        result = await asyncio.to_thread(analyze_live_water_depth, geometry)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Water-depth analysis failed: {exc}") from exc
+
+    kml_id = uuid.uuid4().hex
+    _KML_CACHE[kml_id] = result.pop("kml_bytes")
+    result["kml_id"] = kml_id
+    result["kml_download_url"] = _public_url(request, f"/api/water-depth/kml/{kml_id}")
+    return result
+
+
+@app.get("/api/water-depth/kml/{kml_id}")
+async def download_water_depth_kml(kml_id: str) -> Response:
+    kml_bytes = _KML_CACHE.get(kml_id)
+    if kml_bytes is None:
+        raise HTTPException(status_code=404, detail="KML not found or expired. Run POST /api/water-depth again.")
+    return Response(
+        content=kml_bytes,
+        media_type="application/vnd.google-earth.kml+xml",
+        headers={"Content-Disposition": 'attachment; filename="water_depth.kml"'},
     )
 
 
