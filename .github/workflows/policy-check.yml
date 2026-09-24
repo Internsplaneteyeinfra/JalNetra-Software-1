@@ -1,0 +1,178 @@
+# ============================================================
+# Reusable GitHub Actions Workflow — Software Development Policy
+# 
+# HOW TO USE IN YOUR REPO:
+#   Copy this file to .github/workflows/policy-check.yml
+#   OR reference it as a reusable workflow:
+#
+#   jobs:
+#     policy:
+#       uses: your-org/policy-system/.github/workflows/policy-check.yml@main
+# ============================================================
+name: Policy Compliance Check
+
+on:
+  pull_request:
+    branches: [main, master, develop]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write    # to post report as PR comment
+
+jobs:
+  policy-check:
+    name: Software Development Policy — 25 Rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for git workflow checks
+
+      # ---- Setup policy system ----
+      - name: Setup policy scripts
+        run: chmod +x .policy-system/scripts/*.sh
+
+      # ---- Rule 6: Secrets ----
+      - name: R06 — Secret Detection
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: false
+
+      # ---- Rule 5 & 21: SAST / OWASP ----
+      - name: R05/R21 — SAST Security Scan
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/owasp-top-ten
+            p/secrets
+            p/sql-injection
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        continue-on-error: true
+
+      # ---- Rule 16: Dependencies ----
+      - name: R16 — npm audit
+        if: hashFiles('package-lock.json') != ''
+        run: npm ci && npm audit --audit-level=high
+        continue-on-error: false
+
+      - name: R16 — pip audit
+        if: hashFiles('requirements.txt') != ''
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+        continue-on-error: false
+
+      # ---- Rule 3: Formatting / Lint ----
+      - name: R03 — ESLint
+        if: hashFiles('package.json') != ''
+        run: |
+          npm ci
+          npx eslint . --max-warnings=0 --format json \
+            --output-file eslint-report.json || true
+        continue-on-error: true
+
+      - name: R03 — Python Ruff
+        if: hashFiles('**/*.py') != ''
+        uses: chartboost/ruff-action@v1
+        continue-on-error: true
+
+      # ---- Rule 13: Test Coverage ----
+      - name: R13 — Run Tests & Coverage
+        if: hashFiles('package.json') != ''
+        run: |
+          npm ci
+          npx jest --coverage --coverageReporters=json-summary \
+            --passWithNoTests --forceExit
+        continue-on-error: true
+
+      - name: R13 — Enforce Coverage Threshold
+        if: hashFiles('coverage/coverage-summary.json') != ''
+        run: |
+          python3 -c "
+          import json, sys
+          d = json.load(open('coverage/coverage-summary.json'))
+          pct = d['total']['lines']['pct']
+          print(f'Line coverage: {pct}%')
+          if pct < 70:
+            print(f'FAIL: Coverage {pct}% below 70% threshold')
+            sys.exit(1)
+          "
+
+      # ---- Rule 15: Git Workflow ----
+      - name: R15 — Validate Commit Messages
+        uses: wagoid/commitlint-github-action@v5
+        continue-on-error: true
+
+      # ---- Rule 25: AI Attribution ----
+      - name: R25 — Check PR has AI attribution section
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_BODY="${{ github.event.pull_request.body }}"
+          if echo "$PR_BODY" | grep -qi "ai-generated\|ai-assisted\|vibe cod"; then
+            echo "AI attribution noted in PR description."
+          else
+            echo "WARN: No AI attribution in PR body. If AI was used, note it per Rule 25."
+          fi
+
+      # ---- Collect & Upload Report ----
+      - name: Generate Policy Report
+        if: always()
+        run: |
+          mkdir -p .policy-reports
+          bash .policy-system/scripts/run-checks.sh \
+            "${{ github.repository }}" "${{ github.workspace }}"
+
+      - name: Upload Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: policy-report-${{ github.sha }}
+          path: .policy-reports/
+          retention-days: 30
+
+      # ---- Post summary to PR ----
+      - name: Post Policy Summary to PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const files = fs.readdirSync('.policy-reports/')
+              .filter(f => f.startsWith('results_') && f.endsWith('.json'));
+            if (!files.length) return;
+
+            const data = JSON.parse(
+              fs.readFileSync(`.policy-reports/${files[files.length - 1]}`)
+            );
+            const s = data.summary;
+            const score = Math.round(s.pass / Math.max(s.pass + s.fail + s.warn, 1) * 100);
+            const icon = score >= 80 ? '🟢' : score >= 60 ? '🟡' : '🔴';
+
+            const body = `## ${icon} Policy Compliance Report
+            
+            | | Count |
+            |---|---|
+            | ✔ Pass | ${s.pass} |
+            | ✘ Fail | ${s.fail} |
+            | ⚠ Warn | ${s.warn} |
+            | – Skip | ${s.skip} |
+            | **Score** | **${score}%** |
+            
+            > Full HTML report available in workflow artifacts.
+            > Policy: Software Development Policy v1.2 — 25 Rules
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
