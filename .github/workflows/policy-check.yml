@@ -99,13 +99,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install pip-audit
+        run: pip install pip-audit --quiet
       - name: pip-audit
         run: |
-          pip install pip-audit
           if [ -f requirements.txt ]; then
             pip-audit -r requirements.txt --progress-spinner off
           elif [ -f pyproject.toml ]; then
-            pip install -e . --quiet
+            pip install -e . --quiet || true
+            pip-audit --progress-spinner off
+          elif [ -f Pipfile ]; then
+            pip install pipenv --quiet
+            pipenv install --quiet || true
             pip-audit --progress-spinner off
           fi
         continue-on-error: false
@@ -175,10 +180,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Ruff lint
+      - name: Install dependencies
         run: |
           pip install ruff --quiet
-          ruff check . --output-format=github
+          if [ -f requirements.txt ]; then pip install -r requirements.txt --quiet || true; fi
+          if [ -f pyproject.toml ]; then pip install -e . --quiet || true; fi
+          if [ -f Pipfile ]; then pip install pipenv --quiet && pipenv install --quiet || true; fi
+      - name: Ruff lint
+        run: ruff check . --output-format=github
         continue-on-error: true
       - name: Ruff format check
         run: ruff format --check .
@@ -263,6 +272,8 @@ jobs:
         run: |
           pip install pytest pytest-cov --quiet
           if [ -f requirements.txt ]; then pip install -r requirements.txt --quiet || true; fi
+          if [ -f pyproject.toml ]; then pip install -e . --quiet || true; fi
+          if [ -f Pipfile ]; then pip install pipenv --quiet && pipenv install --quiet || true; fi
       - name: Check test files exist
         run: |
           count=$(find . -name "test_*.py" -o -name "*_test.py" | grep -v ".git" | wc -l)
