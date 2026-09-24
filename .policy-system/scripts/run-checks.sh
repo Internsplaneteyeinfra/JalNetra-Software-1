@@ -5,7 +5,7 @@
 # Usage: ./scripts/run-checks.sh [project_name] [project_path]
 # ============================================================
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POLICY_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -45,29 +45,30 @@ run_check() {
 
   echo -e "${BLUE}▶ Checking Rule ${rule_id}: ${rule_name}${NC}"
 
-  if bash "$POLICY_DIR/scripts/${check_script}" "$PROJECT_PATH" 2>&1; then
+  # run check, capture exit code without letting -e abort the script
+  local exit_code=0
+  bash "$POLICY_DIR/scripts/${check_script}" "$PROJECT_PATH" 2>&1 || exit_code=$?
+
+  if [ $exit_code -eq 0 ]; then
     RULE_RESULTS["$rule_id"]="PASS"
     RULE_MESSAGES["$rule_id"]="All checks passed"
     echo -e "  ${GREEN}✔ PASS${NC}"
-    ((PASS++))
+    ((PASS++)) || true
+  elif [ $exit_code -eq 2 ]; then
+    RULE_RESULTS["$rule_id"]="WARN"
+    RULE_MESSAGES["$rule_id"]="Warning — review recommended"
+    echo -e "  ${YELLOW}⚠ WARN${NC}"
+    ((WARN++)) || true
+  elif [ $exit_code -eq 3 ]; then
+    RULE_RESULTS["$rule_id"]="SKIP"
+    RULE_MESSAGES["$rule_id"]="Skipped — not applicable"
+    echo -e "  ${YELLOW}– SKIP${NC}"
+    ((SKIP++)) || true
   else
-    local exit_code=$?
-    if [ $exit_code -eq 2 ]; then
-      RULE_RESULTS["$rule_id"]="WARN"
-      RULE_MESSAGES["$rule_id"]="Warning — review recommended"
-      echo -e "  ${YELLOW}⚠ WARN${NC}"
-      ((WARN++))
-    elif [ $exit_code -eq 3 ]; then
-      RULE_RESULTS["$rule_id"]="SKIP"
-      RULE_MESSAGES["$rule_id"]="Skipped — not applicable"
-      echo -e "  ${YELLOW}– SKIP${NC}"
-      ((SKIP++))
-    else
-      RULE_RESULTS["$rule_id"]="FAIL"
-      RULE_MESSAGES["$rule_id"]="Violations found — see report"
-      echo -e "  ${RED}✘ FAIL${NC}"
-      ((FAIL++))
-    fi
+    RULE_RESULTS["$rule_id"]="FAIL"
+    RULE_MESSAGES["$rule_id"]="Violations found — see report"
+    echo -e "  ${RED}✘ FAIL${NC}"
+    ((FAIL++)) || true
   fi
   echo ""
 }
@@ -105,16 +106,19 @@ cat > "$RESULTS_FILE" <<EOF
   "rules": {
 EOF
 
-first=true
+# write each rule as valid JSON entries
+rule_count=0
+total_rules=${#RULE_RESULTS[@]}
 for rule_id in "${!RULE_RESULTS[@]}"; do
-  if [ "$first" = false ]; then echo ',' >> "$RESULTS_FILE"; fi
+  rule_count=$((rule_count + 1))
+  comma=""
+  [ $rule_count -lt $total_rules ] && comma=","
   cat >> "$RESULTS_FILE" <<EOF
     "$rule_id": {
       "status": "${RULE_RESULTS[$rule_id]}",
       "message": "${RULE_MESSAGES[$rule_id]}"
-    }
+    }${comma}
 EOF
-  first=false
 done
 
 echo "  }" >> "$RESULTS_FILE"

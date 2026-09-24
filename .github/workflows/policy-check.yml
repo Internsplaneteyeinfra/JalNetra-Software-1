@@ -125,6 +125,7 @@ jobs:
       # ---- Collect & Upload Report ----
       - name: Generate Policy Report
         if: always()
+        continue-on-error: true
         run: |
           mkdir -p .policy-reports
           bash .policy-system/scripts/run-checks.sh \
