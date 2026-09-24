@@ -56,19 +56,10 @@ jobs:
           mkdir -p .policy-reports
           if [ -f gitleaks-report.sarif ]; then
             cp gitleaks-report.sarif .policy-reports/gitleaks.sarif
-            # Count findings
-            count=$(python3 -c "
-import json
-try:
-    d = json.load(open('gitleaks-report.sarif'))
-    findings = d['runs'][0].get('results', [])
-    print(len(findings))
-except:
-    print(0)
-" 2>/dev/null || echo 0)
+            count=$(python3 -c 'import json,sys; d=json.load(open("gitleaks-report.sarif")); print(len(d["runs"][0].get("results",[])))' 2>/dev/null || echo 0)
             echo "Secrets found: $count"
-            if [ "$count" -gt 0 ]; then
-              echo "FAIL: $count secret(s) detected in repository"
+            if [ "$count" -gt "0" ]; then
+              echo "FAIL: $count secret(s) detected"
               exit 1
             fi
           fi
